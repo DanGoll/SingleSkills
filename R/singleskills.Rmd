@@ -1,0 +1,1348 @@
+---
+title: "Which Skills Matter Most for Early Labor Market Success?"
+author: "Daniel Goller and Roberto Sartore"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+    toc: true
+fontsize: 11pt
+geometry: margin=1in
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{threeparttable}
+  - \usepackage{float}
+  - \usepackage{setspace}
+params:
+  data_file: "singleskills_v10b.csv"
+  min_occ_n: 25
+  min_eligible_occ_compare: 5
+  alpha_grid: [0.10, 0.25, 0.33, 0.5, 0.66, 0.75, 0.90, 1.00]
+  nfolds: 10
+  lambda_rule: "lambda.min"
+  B_main: 100
+  B_occ: 50
+  subsample_frac_main: 0.75
+  subsample_frac_occ: 0.80
+  knot_hi: 1
+  min_penalty_factor: 0.50
+  max_penalty_factor: 1.25
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8.5,
+  fig.height = 5.5,
+  out.width = "90%"
+)
+
+datadir <- Sys.getenv("DATADIR_SK")
+workdir <- Sys.getenv("WORKDIR_SK")
+
+if (datadir == "") stop("Environment variable DATADIR_SK is not set.")
+if (workdir == "") stop("Environment variable WORKDIR_SK is not set.")
+
+data_path  <- file.path(datadir, params$data_file)
+output_dir <- file.path(workdir, "out")
+
+required_packages <- c(
+  "dplyr", "tidyr", "readr", "stringr", "purrr", "ggplot2",
+  "glmnet", "Matrix", "knitr", "kableExtra", "forcats", "scales", "glue"
+)
+
+to_install <- required_packages[!required_packages %in% installed.packages()[, "Package"]]
+if (length(to_install) > 0) {
+  install.packages(to_install, dependencies = TRUE)
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+options(dplyr.summarise.inform = FALSE, scipen = 999)
+theme_set(theme_minimal(base_size = 11))
+
+set.seed(123)
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r helpers, include=FALSE}
+stop_if_missing_cols <- function(dat, required_cols) {
+  missing_cols <- setdiff(required_cols, names(dat))
+  if (length(missing_cols) > 0) {
+    stop("The following required columns are missing from the input data: ",
+         paste(missing_cols, collapse = ", "))
+  }
+}
+
+safe_sd <- function(x) {
+  out <- stats::sd(x, na.rm = TRUE)
+  if (is.na(out)) out <- 0
+  out
+}
+
+safe_mean <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  mean(x)
+}
+
+safe_sd2 <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) <= 1) return(NA_real_)
+  stats::sd(x)
+}
+
+translate_module_label <- function(moduleid) {
+  dplyr::case_when(
+    moduleid == "1"  ~ "German",
+    moduleid == "2"  ~ "French",
+    moduleid == "3"  ~ "Italian",
+    moduleid == "4"  ~ "English",
+    moduleid == "5"  ~ "Mathematics",
+    moduleid == "6"  ~ "Logic",
+    moduleid == "10" ~ "Perception",
+    moduleid == "11" ~ "Natural Sciences",
+    moduleid == "12" ~ "Concentration",
+    moduleid == "14" ~ "Short-Term Memory",
+    moduleid == "15" ~ "Memory Capacity",
+    moduleid == "17" ~ "Organizational Skills",
+    moduleid == "18" ~ "Spatial Visualization",
+    moduleid == "21" ~ "Technical Understanding",
+    moduleid == "24" ~ "Spatial Visualization",
+    moduleid == "27" ~ "Basic IT Knowledge",
+    moduleid == "29" ~ "Networked Thinking",
+    moduleid == "40" ~ "Basic Graphic Skills",
+    moduleid == "49" ~ "First Customer Contact",
+    moduleid == "50" ~ "Customer Needs",
+    moduleid == "51" ~ "Complaint Handling",
+    moduleid == "52" ~ "Team Conflict",
+    moduleid == "53" ~ "Customer-Specific Communication",
+    moduleid == "54" ~ "Networked Thinking",
+    moduleid == "61" ~ "Customer Contact",
+    moduleid == "62" ~ "Dealing with Errors",
+    moduleid == "63" ~ "Teamwork",
+    moduleid == "64" ~ "Digital Competencies",
+    moduleid == "65" ~ "Organizational Skills",
+    TRUE ~ paste0("Module ", moduleid)
+  )
+}
+
+make_stratified_foldid <- function(y, nfolds = 10, seed = 123) {
+  set.seed(seed)
+  y <- as.integer(y)
+  n <- length(y)
+  
+  if (nfolds < 4) stop("nfolds must be at least 4.")
+  if (nfolds > n) stop("nfolds cannot exceed the number of observations.")
+  
+  foldid <- integer(n)
+  classes <- sort(unique(stats::na.omit(y)))
+  
+  if (length(classes) >= 2 && min(table(y)) >= nfolds) {
+    for (cl in classes) {
+      idx <- which(y == cl)
+      foldid[idx] <- sample(rep(seq_len(nfolds), length.out = length(idx)))
+    }
+  } else {
+    foldid <- sample(rep(seq_len(nfolds), length.out = n))
+  }
+  
+  foldid
+}
+
+effective_nfolds <- function(y, requested_nfolds = 10) {
+  n <- length(y)
+  
+  if (n < 4) stop("Too few observations for cv.glmnet: need at least 4.")
+  
+  nfolds_eff <- min(requested_nfolds, max(4L, floor(n / 5)))
+  nfolds_eff <- min(nfolds_eff, n)
+  nfolds_eff <- max(4L, nfolds_eff)
+  
+  as.integer(nfolds_eff)
+}
+
+extract_named_beta <- function(cvfit, s, target_names) {
+  beta_mat <- as.matrix(stats::coef(cvfit, s = s))
+  beta_vec <- setNames(rep(0, length(target_names)), target_names)
+  common <- intersect(target_names, rownames(beta_mat))
+  beta_vec[common] <- beta_mat[common, 1]
+  beta_vec
+}
+
+make_penalty_factors <- function(feature_names,
+                                 exposure_tbl,
+                                 min_pf = 0.50,
+                                 max_pf = 1.25) {
+  stopifnot(all(c("skill_var", "n_exposed") %in% names(exposure_tbl)))
+  
+  prev <- exposure_tbl$n_exposed
+  names(prev) <- exposure_tbl$skill_var
+  prev_use <- prev[feature_names]
+  
+  if (any(is.na(prev_use))) {
+    stop("Exposure counts are missing for some features: ",
+         paste(feature_names[is.na(prev_use)], collapse = ", "))
+  }
+  
+  scaled <- sqrt(prev_use / max(prev_use))
+  
+  if (length(unique(round(scaled, 8))) == 1L) {
+    pf <- rep(1, length(scaled))
+  } else {
+    pf <- min_pf + (scaled - min(scaled)) / (max(scaled) - min(scaled)) * (max_pf - min_pf)
+  }
+  
+  names(pf) <- feature_names
+  pf
+}
+
+make_sparse_design <- function(dat, fe_var, feature_vars) {
+  rhs <- paste(c(fe_var, feature_vars), collapse = " + ")
+  fml <- stats::as.formula(paste0("~ 0 + ", rhs))
+  Matrix::sparse.model.matrix(fml, data = dat)
+}
+
+build_penalty_vector <- function(x_colnames, feature_pf_named) {
+  pf <- rep(0, length(x_colnames))
+  names(pf) <- x_colnames
+  
+  is_feature <- x_colnames %in% names(feature_pf_named)
+  pf[is_feature] <- feature_pf_named[x_colnames[is_feature]]
+  pf
+}
+
+fit_cv_enet_alpha_grid <- function(X, y,
+                                   alpha_grid = c(0.25, 0.5, 0.75, 1.0),
+                                   requested_nfolds = 10,
+                                   penalty.factor = NULL,
+                                   lambda_rule = c("lambda.1se", "lambda.min"),
+                                   family = "gaussian",
+                                   seed = 123) {
+  lambda_rule <- match.arg(lambda_rule)
+  nfolds_eff <- effective_nfolds(y, requested_nfolds)
+  foldid <- make_stratified_foldid(y, nfolds = nfolds_eff, seed = seed)
+  
+  fits <- vector("list", length(alpha_grid))
+  scores <- rep(NA_real_, length(alpha_grid))
+  lambdas <- rep(NA_real_, length(alpha_grid))
+  
+  for (i in seq_along(alpha_grid)) {
+    a <- alpha_grid[i]
+    cvfit <- glmnet::cv.glmnet(
+      x = X,
+      y = y,
+      family = family,
+      alpha = a,
+      foldid = foldid,
+      nfolds = nfolds_eff,
+      penalty.factor = penalty.factor,
+      standardize = FALSE,
+      intercept = FALSE,
+      type.measure = if (family == "gaussian") "mse" else "deviance"
+    )
+    
+    fits[[i]] <- cvfit
+    lambda_sel <- if (lambda_rule == "lambda.1se") cvfit$lambda.1se else cvfit$lambda.min
+    idx <- which.min(abs(cvfit$lambda - lambda_sel))
+    scores[i] <- cvfit$cvm[idx]
+    lambdas[i] <- lambda_sel
+  }
+  
+  best_idx <- which.min(scores)
+  
+  list(
+    cvfit = fits[[best_idx]],
+    alpha = alpha_grid[best_idx],
+    lambda = lambdas[best_idx],
+    tuning_table = tibble::tibble(
+      alpha = alpha_grid,
+      cv_score = scores,
+      lambda = lambdas
+    ),
+    nfolds_eff = nfolds_eff
+  )
+}
+
+stability_subsampling <- function(X, y,
+                                  feature_names,
+                                  alpha,
+                                  requested_nfolds = 10,
+                                  penalty.factor = NULL,
+                                  B = 100,
+                                  subsample_frac = 0.75,
+                                  lambda_rule = c("lambda.1se", "lambda.min"),
+                                  family = "gaussian",
+                                  seed = 123) {
+  lambda_rule <- match.arg(lambda_rule)
+  
+  n <- nrow(X)
+  p <- length(feature_names)
+  
+  sel_mat  <- matrix(0L, nrow = B, ncol = p, dimnames = list(NULL, feature_names))
+  beta_mat <- matrix(0,   nrow = B, ncol = p, dimnames = list(NULL, feature_names))
+  
+  for (b in seq_len(B)) {
+    set.seed(seed + b)
+    idx <- sort(sample.int(n, size = max(10, floor(subsample_frac * n)), replace = FALSE))
+    
+    y_b <- y[idx]
+    nfolds_eff <- effective_nfolds(y_b, requested_nfolds)
+    foldid_b <- make_stratified_foldid(y_b, nfolds = nfolds_eff, seed = seed + b)
+    
+    cvfit_b <- glmnet::cv.glmnet(
+      x = X[idx, , drop = FALSE],
+      y = y_b,
+      family = family,
+      alpha = alpha,
+      foldid = foldid_b,
+      nfolds = nfolds_eff,
+      penalty.factor = penalty.factor,
+      standardize = FALSE,
+      intercept = FALSE,
+      type.measure = if (family == "gaussian") "mse" else "deviance"
+    )
+    
+    lambda_b <- if (lambda_rule == "lambda.1se") cvfit_b$lambda.1se else cvfit_b$lambda.min
+    beta_b   <- extract_named_beta(cvfit_b, s = lambda_b, target_names = feature_names)
+    
+    beta_mat[b, ] <- beta_b
+    sel_mat[b, ]  <- as.integer(abs(beta_b) > 1e-10)
+  }
+  
+  tibble::tibble(
+    feature = feature_names,
+    selection_freq = colMeans(sel_mat),
+    beta_subsample_median = apply(beta_mat, 2, median, na.rm = TRUE)
+  )
+}
+
+make_piecewise_features <- function(dat, skill_vars, knot = 1) {
+  out <- dat
+  map_tbl <- tibble::tibble(
+    skill_var = skill_vars,
+    lo_var = paste0(skill_vars, "_lo"),
+    hi_var = paste0(skill_vars, "_hi")
+  )
+  
+  for (i in seq_len(nrow(map_tbl))) {
+    s  <- map_tbl$skill_var[i]
+    lo <- map_tbl$lo_var[i]
+    hi <- map_tbl$hi_var[i]
+    
+    x <- out[[s]]
+    out[[lo]] <- pmin(x, knot)
+    out[[hi]] <- pmax(x - knot, 0)
+  }
+  
+  list(data = out, map = map_tbl)
+}
+
+estimate_occ_specific_results <- function(dat,
+                                          skill_vars,
+                                          occ_exposure_tbl,
+                                          alpha,
+                                          requested_nfolds = 10,
+                                          lambda_rule = "lambda.1se",
+                                          B_occ = 20,
+                                          subsample_frac_occ = 0.80,
+                                          min_occ_n = 25,
+                                          min_pf = 0.50,
+                                          max_pf = 1.25,
+                                          family = "gaussian",
+                                          seed = 777) {
+  occ_ids <- sort(unique(dat$sbfinr))
+  out_list <- list()
+  counter <- 1L
+  
+  for (occ in occ_ids) {
+    d_occ <- dat %>% dplyr::filter(sbfinr == occ)
+    if (nrow(d_occ) < min_occ_n) next
+    if (dplyr::n_distinct(d_occ$success_2123) < 2) next
+    
+    sd_vec <- vapply(skill_vars, function(v) safe_sd(d_occ[[v]]), numeric(1))
+    
+    occ_exp <- occ_exposure_tbl %>%
+      dplyr::filter(sbfinr == occ) %>%
+      dplyr::rename(feature = skill_var)
+    
+    occ_grid <- tibble::tibble(feature = skill_vars) %>%
+      dplyr::left_join(occ_exp, by = "feature") %>%
+      dplyr::mutate(
+        n_exposed = dplyr::coalesce(n_exposed, 0L),
+        feature_sd = sd_vec[feature],
+        eligible = (n_exposed > 0) & (feature_sd > 0)
+      )
+    
+    eligible_skills <- occ_grid %>% dplyr::filter(eligible) %>% dplyr::pull(feature)
+    if (length(eligible_skills) == 0) next
+    
+    pf_occ <- make_penalty_factors(
+      feature_names = eligible_skills,
+      exposure_tbl  = occ_grid %>%
+        dplyr::filter(eligible) %>%
+        dplyr::transmute(skill_var = feature, n_exposed = n_exposed),
+      min_pf = min_pf,
+      max_pf = max_pf
+    )
+    
+    X_occ <- make_sparse_design(d_occ, fe_var = "year_id", feature_vars = eligible_skills)
+    pf_vec_occ <- build_penalty_vector(colnames(X_occ), pf_occ)
+    y_occ <- d_occ$success_2123
+    
+    nfolds_eff <- effective_nfolds(y_occ, requested_nfolds)
+    foldid_occ <- make_stratified_foldid(y_occ, nfolds = nfolds_eff, seed = seed + counter)
+    
+    cvfit_occ <- glmnet::cv.glmnet(
+      x = X_occ,
+      y = y_occ,
+      family = family,
+      alpha = alpha,
+      foldid = foldid_occ,
+      nfolds = nfolds_eff,
+      penalty.factor = pf_vec_occ,
+      standardize = FALSE,
+      intercept = FALSE,
+      type.measure = if (family == "gaussian") "mse" else "deviance"
+    )
+    
+    lambda_occ <- if (lambda_rule == "lambda.1se") cvfit_occ$lambda.1se else cvfit_occ$lambda.min
+    beta_occ   <- extract_named_beta(cvfit_occ, s = lambda_occ, target_names = eligible_skills)
+    
+    stab_occ <- stability_subsampling(
+      X = X_occ,
+      y = y_occ,
+      feature_names = eligible_skills,
+      alpha = alpha,
+      requested_nfolds = requested_nfolds,
+      penalty.factor = pf_vec_occ,
+      B = B_occ,
+      subsample_frac = subsample_frac_occ,
+      lambda_rule = lambda_rule,
+      family = family,
+      seed = seed + 1000 + counter
+    )
+    
+    res_occ <- occ_grid %>%
+      dplyr::mutate(
+        sbfinr = occ,
+        n_occ = nrow(d_occ),
+        n_years = dplyr::n_distinct(d_occ$startyearofseason),
+        beta_full = NA_real_,
+        selection_freq = NA_real_,
+        sw = NA_real_
+      )
+    
+    match_idx <- match(eligible_skills, res_occ$feature)
+    res_occ$beta_full[match_idx] <- beta_occ[eligible_skills]
+    res_occ$selection_freq[match_idx] <- stab_occ$selection_freq[match(eligible_skills, stab_occ$feature)]
+    res_occ$sw[match_idx] <- abs(res_occ$beta_full[match_idx]) * res_occ$selection_freq[match_idx]
+    
+    out_list[[counter]] <- res_occ
+    counter <- counter + 1L
+  }
+  
+  dplyr::bind_rows(out_list)
+}
+
+fmt_n <- function(x) scales::comma(round(x))
+fmt_p <- function(x, digits = 1) paste0(formatC(100 * x, format = "f", digits = digits), "\\%")
+fmt_num <- function(x, digits = 3) formatC(x, format = "f", digits = digits)
+```
+
+# Abstract
+
+This paper asks which measured skills are most strongly associated with early labor market success and whether those skill rewards are universal or occupation-specific. Using person-module test data, we construct standardized module-level competence measures within occupation-by-entry-year cells and relate them to a binary indicator of early training success, defined as the absence of training dropout. To rank skills in a high-dimensional setting, we estimate fixed-effects elastic net models with stability-based variable selection and complement the pooled analysis with occupation-specific models that quantify universality, sign consistency, and cross-occupation heterogeneity. The resulting framework distinguishes skills that are broadly rewarded across occupations from skills whose importance is concentrated in particular occupational contexts.
+
+# Introduction
+
+Human capital is increasingly understood as a multidimensional bundle of skills rather than years of schooling alone, raising the question of how to measure which skills workers possess and how strongly labor markets reward them. Recent work uses new data sources to quantify skill value at scale, for example by leveraging self-reported skill sets on LinkedIn profiles or by extracting skill content from vocational curricula. At the same time, a large literature estimates returns to skills using narrower proxies, most prominently test scores in basic cognitive domains, and documents that noncognitive and social skills matter strongly in modern labor markets. These approaches capture complementary but distinct objects: whether individuals possess or report a skill, what training programs intend to teach, and how proficient individuals actually are in performing relevant tasks.
+
+This paper focuses on the intensive margin of skill proficiency. The data observe module-level test performance in occupation-specific assessments. Each individual completes a subset of modules, and the set of tested modules is largely determined by the occupation. This setting provides two advantages. First, the modules are occupationally meaningful rather than generic school subjects. Second, the design makes it possible to compare individuals within narrowly defined occupation-by-entry-year cells, thereby holding constant the broad occupational environment and the tested skill set of that environment.
+
+The main research question is straightforward: **which skill is most valuable to master for early labor market success?** The secondary question is equally important: **are the most valuable skills universally rewarded across occupations, or does their importance differ strongly across occupations?** To answer these questions, the analysis proceeds in two steps. First, it estimates pooled person-level models with occupation-by-entry-year fixed effects and elastic net regularization. Second, it re-estimates analogous models occupation by occupation, controlling for entry-year fixed effects, and uses the resulting occupation-specific rankings to measure universality and heterogeneity.
+
+The empirical goal is predictive ranking rather than causal identification. Coefficients should therefore be read as regularized within-group associations: they show which module-specific competencies are most strongly associated with early success, conditional on being in the same occupation and entry cohort. The approach combines high-dimensional regularization with repeated subsampling, which makes it possible to separate skills that appear important in one specific sample split from skills that are robustly selected across repeated re-estimation.
+
+# Data and construction of the analysis sample
+
+```{r data-preparation, include=FALSE}
+required_cols <- c(
+  "gteid", "moduleid", "sbfinr", "score_mod",
+  "dropout_2123", "startyearofseason"
+)
+
+raw <- readr::read_csv(data_path, show_col_types = FALSE)
+stop_if_missing_cols(raw, required_cols)
+
+dat0 <- raw %>%
+  dplyr::transmute(
+    gteid = as.character(gteid),
+    moduleid = as.character(moduleid),
+    sbfinr = as.character(sbfinr),
+    score_mod = as.numeric(score_mod),
+    dropout_2123 = as.integer(dropout_2123),
+    startyearofseason = as.character(startyearofseason)
+  ) %>%
+  dplyr::filter(
+    !is.na(gteid),
+    !is.na(moduleid),
+    !is.na(sbfinr),
+    !is.na(score_mod),
+    !is.na(dropout_2123),
+    !is.na(startyearofseason)
+  )
+
+if (!all(sort(unique(dat0$dropout_2123)) %in% c(0L, 1L))) {
+  stop("dropout_2123 must be coded 0/1.")
+}
+
+dat0 <- dat0 %>%
+  dplyr::group_by(gteid, sbfinr, startyearofseason, dropout_2123, moduleid) %>%
+  dplyr::summarise(score_mod = mean(score_mod, na.rm = TRUE), .groups = "drop")
+
+consistency_check <- dat0 %>%
+  dplyr::group_by(gteid) %>%
+  dplyr::summarise(
+    n_occ = dplyr::n_distinct(sbfinr),
+    n_year = dplyr::n_distinct(startyearofseason),
+    n_dropout = dplyr::n_distinct(dropout_2123),
+    .groups = "drop"
+  )
+
+if (any(consistency_check$n_occ > 1 | consistency_check$n_year > 1 | consistency_check$n_dropout > 1)) {
+  stop(paste(
+    "At least one gteid is not uniquely associated with a single occupation, cohort, and dropout outcome.",
+    "Please inspect duplicates before estimating the paper."
+  ))
+}
+
+skill_lookup <- dat0 %>%
+  dplyr::distinct(moduleid) %>%
+  dplyr::arrange(suppressWarnings(as.numeric(moduleid)), moduleid) %>%
+  dplyr::mutate(
+    skill_var = paste0("skill_m", make.names(moduleid)),
+    module_label = translate_module_label(moduleid),
+    module_label_display = paste0(module_label, " [", moduleid, "]")
+  )
+
+dat1 <- dat0 %>%
+  dplyr::left_join(skill_lookup, by = "moduleid") %>%
+  dplyr::group_by(sbfinr, startyearofseason, moduleid) %>%
+  dplyr::mutate(
+    group_module_n = dplyr::n(),
+    group_module_mean = mean(score_mod, na.rm = TRUE),
+    group_module_sd = safe_sd(score_mod),
+    score_z = dplyr::if_else(
+      group_module_sd > 0,
+      (score_mod - group_module_mean) / group_module_sd,
+      0
+    )
+  ) %>%
+  dplyr::ungroup()
+
+person_base <- dat1 %>%
+  dplyr::group_by(gteid) %>%
+  dplyr::summarise(
+    sbfinr = dplyr::first(sbfinr),
+    startyearofseason = dplyr::first(startyearofseason),
+    dropout_2123 = dplyr::first(dropout_2123),
+    success_2123 = 1L - dplyr::first(dropout_2123),
+    n_modules_taken = dplyr::n_distinct(moduleid),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    group_id = factor(paste(sbfinr, startyearofseason, sep = "_")),
+    year_id = factor(startyearofseason)
+  )
+
+wide_scores <- dat1 %>%
+  dplyr::select(gteid, skill_var, score_z) %>%
+  dplyr::distinct() %>%
+  tidyr::pivot_wider(
+    names_from = skill_var,
+    values_from = score_z
+  )
+
+analysis_df <- person_base %>%
+  dplyr::left_join(wide_scores, by = "gteid")
+
+skill_vars <- setdiff(names(analysis_df), names(person_base))
+
+for (v in skill_vars) {
+  analysis_df[[v]][is.na(analysis_df[[v]])] <- 0
+  analysis_df[[v]] <- as.numeric(analysis_df[[v]])
+}
+
+skill_exposure <- dat1 %>%
+  dplyr::count(skill_var, name = "n_exposed")
+
+occ_exposure <- dat1 %>%
+  dplyr::count(sbfinr, skill_var, name = "n_exposed")
+
+sample_summary <- tibble::tibble(
+  Statistic = c(
+    "Individuals",
+    "Person-module observations",
+    "Occupations",
+    "Entry cohorts",
+    "Occupation-by-cohort groups",
+    "Distinct modules",
+    "Mean tested modules per person",
+    "Median tested modules per person",
+    "Mean dropout rate",
+    "Mean success rate"
+  ),
+  Value = c(
+    nrow(person_base),
+    nrow(dat1),
+    dplyr::n_distinct(person_base$sbfinr),
+    dplyr::n_distinct(person_base$startyearofseason),
+    dplyr::n_distinct(person_base$group_id),
+    dplyr::n_distinct(dat1$moduleid),
+    mean(person_base$n_modules_taken),
+    median(person_base$n_modules_taken),
+    mean(person_base$dropout_2123),
+    mean(person_base$success_2123)
+  )
+)
+
+readr::write_csv(skill_lookup, file.path(output_dir, "skill_lookup.csv"))
+readr::write_csv(person_base, file.path(output_dir, "person_base.csv"))
+```
+
+The raw data are stored at the person-module level: each row represents one test module completed by one individual. The key variables are the individual identifier (`gteid`), the module identifier (`moduleid`), the occupation (`sbfinr`), the test score in the module (`score_mod`), the entry year (`startyearofseason`), and a binary indicator for early training dropout (`dropout_2123`). For the analysis, the outcome is recoded into a success indicator, equal to one if the individual does **not** drop out.
+
+The main empirical challenge is that individuals do not take the same modules. Instead, each occupation tests a specific subset of modules, and each individual typically completes only the modules relevant for that occupation. To create a person-level dataset that is compatible with high-dimensional penalized estimation, the long data are reshaped into a wide matrix with one row per individual and one column per module. Before reshaping, each module score is standardized within occupation-by-entry-year cells. This step is important because it makes coefficients comparable across modules and ensures that identification comes from within-cell differences in module performance.
+
+A second important design choice concerns modules that are not tested in a given occupation-year cell. These are not genuine missing values; they are structurally absent because the occupation does not test that module. After within-cell standardization, non-tested modules are therefore set to zero in the wide matrix. This is a neutral coding: a value of zero means that the module contributes no within-group deviation for that individual in that cell. Since the models include occupation-by-entry-year fixed effects, between-group differences in the tested skill set are absorbed by the fixed effects, and coefficients are identified only from cells in which a module varies across individuals.
+
+In the final estimation sample there are `r fmt_n(nrow(person_base))` individuals, `r fmt_n(nrow(dat1))` person-module observations, `r fmt_n(dplyr::n_distinct(person_base$sbfinr))` occupations, and `r fmt_n(dplyr::n_distinct(dat1$moduleid))` distinct modules. On average, individuals complete `r fmt_num(mean(person_base$n_modules_taken), 2)` modules. The mean dropout rate is `r fmt_p(mean(person_base$dropout_2123), 1)`, implying a mean success rate of `r fmt_p(mean(person_base$success_2123), 1)`.
+
+```{r sample-summary-table}
+sample_summary_print <- sample_summary %>%
+  dplyr::mutate(
+    Value = dplyr::if_else(
+      Statistic %in% c("Mean dropout rate", "Mean success rate"),
+      paste0(formatC(100 * as.numeric(Value), format = "f", digits = 1), "\\%"),
+      dplyr::if_else(
+        Statistic %in% c("Mean tested modules per person", "Median tested modules per person"),
+        formatC(as.numeric(Value), format = "f", digits = 2),
+        scales::comma(round(as.numeric(Value)))
+      )
+    )
+  )
+
+knitr::kable(
+  sample_summary_print,
+  format = "latex",
+  booktabs = TRUE,
+  caption = "Sample overview.",
+  align = c("l", "r")
+) %>%
+  kableExtra::kable_styling(latex_options = c("hold_position"))
+```
+
+# Empirical strategy
+
+## Pooled fixed-effects competence model
+
+Let \( i \) index individuals and let \( g(i) \) denote the occupation-by-entry-year group to which individual \( i \) belongs. The main outcome is early training success,
+\[
+S_i = 1 - \text{dropout}_{i},
+\]
+so that higher values are better. For each module \( m \), let \( z_{im} \) denote the module score standardized within the relevant occupation-year cell. The pooled baseline specification is
+\[
+S_i = \alpha_{g(i)} + \sum_{m=1}^{M} \beta_m z_{im} + \varepsilon_i.
+\]
+
+The fixed effects \(\alpha_{g(i)}\) absorb all mean differences across occupation-by-entry-year cells. This includes differences in baseline dropout risk, differences in occupation-specific training environments, and the fact that occupations test different sets of modules. The coefficients \(\beta_m\) are therefore identified from within-cell comparisons among individuals in the same occupation and entry cohort who differ in standardized performance on module \(m\).
+
+The coefficients are interpreted as regularized associations, not causal effects. Because the regressors are standardized within cell, coefficient magnitudes are directly comparable across modules. A larger positive coefficient indicates that performing one standard deviation better in that module is associated with a larger increase in the probability of success, conditional on the occupation-year fixed effect.
+
+## Piecewise specification for high-performance premiums
+
+The baseline model assumes a linear association between proficiency and success. To allow the reward to proficiency to differ between the typical range and the top range of the skill distribution, the paper estimates a second specification with a knot at one standard deviation above the cell mean:
+\[
+S_i = \alpha_{g(i)} + \sum_{m=1}^{M}
+\left(
+\beta_m^{\text{lo}} z_{im}^{\text{lo}} +
+\beta_m^{\text{hi}} z_{im}^{\text{hi}}
+\right) + \varepsilon_i,
+\]
+where
+\[
+z_{im}^{\text{lo}} = \min(z_{im}, 1),
+\qquad
+z_{im}^{\text{hi}} = \max(z_{im} - 1, 0).
+\]
+
+In this parameterization, \(\beta_m^{\text{lo}}\) captures the slope up to the one-standard-deviation threshold, while \(\beta_m^{\text{hi}}\) measures the additional slope above that threshold. A positive \(\beta_m^{\text{hi}}\) implies that the association becomes stronger in the high-performance range.
+
+## Elastic net regularization
+
+The number of potential skill regressors is large and many modules are correlated because they are embedded in overlapping occupational skill bundles. For that reason, all high-dimensional models are estimated using elastic net regularization, which combines an \(\ell_1\) penalty that induces sparsity and an \(\ell_2\) penalty that stabilizes estimation under correlated regressors. The penalty mixing parameter \(\alpha\) is selected from a user-defined grid by cross-validation, and the final penalty strength \(\lambda\) is chosen using the rule specified in the R Markdown parameters. This yields an interpretable ranking in which the degree of sparsity is disciplined by out-of-sample fit rather than chosen ad hoc.
+
+The fixed effects are included as unpenalized dummy variables. In practice, this means that the elastic net selects among module variables while always partialling out occupation-year or year effects.
+
+## Rare-skill penalty adjustment
+
+A purely mechanical issue in penalized high-dimensional models is that rarely observed skills can be disadvantaged. When a module is tested in relatively few settings, its coefficient is estimated from fewer effective observations, making it noisier and therefore more vulnerable to shrinkage. To reduce this mechanical selection bias, each skill receives a feature-specific penalty factor based on its exposure count. Skills with fewer observations receive smaller penalty factors and hence weaker shrinkage, within predefined bounds. This makes the ranking less sensitive to how frequently a module appears in the data.
+
+## Stability-weighted ranking
+
+To ensure that the ranking is not an artifact of a single estimation sample, the paper complements the full-sample elastic net estimate with repeated subsampling. For each subsample, the penalized model is re-estimated and the selected skill set is recorded. For each skill \(m\), the stability measure is the selection frequency
+\[
+\pi_m = \Pr(\text{module } m \text{ receives a non-zero coefficient}).
+\]
+The main pooled ranking is based on the stability-weighted score
+\[
+SW_m = \pi_m \cdot |\beta_m|.
+\]
+A skill receives a high score if it has both a large coefficient in the full-sample estimate and a high probability of being selected across repeated re-estimation.
+
+## Occupation-specific models and universality
+
+To study whether the importance of a skill is universal or occupation-specific, the paper repeats the baseline model separately within each occupation \(o\), restricting the sample to occupations with at least \(N \geq `r params$min_occ_n`\) individuals:
+\[
+S_i = \alpha_{t(i)}^{(o)} + \sum_{m=1}^{M_o} \beta_{mo} z_{im} + \varepsilon_i,
+\]
+where \(\alpha_{t(i)}^{(o)}\) are entry-year fixed effects within occupation \(o\).
+
+These occupation-specific estimates produce a stability-weighted skill score \(SW_{mo}\) for each module \(m\) within occupation \(o\). The paper then aggregates these occupation-specific values into transparent summary measures:
+
+\[
+\overline{SW}_m = \text{mean}_o(SW_{mo}),
+\qquad
+SD_m = \text{sd}_o(SW_{mo}),
+\qquad
+CV_m = \frac{SD_m}{\overline{SW}_m}.
+\]
+
+In addition, the paper computes:
+
+- **Coverage**: the share of eligible occupations in which a skill is selected at least once.
+- **Sign consistency**: the dominant-sign share among selected occupation-specific coefficients.
+- **Universality score**:
+\[
+U_m = \frac{\overline{SW}_m \cdot \text{Coverage}_m \cdot \text{SignConsistency}_m}{1 + CV_m}.
+\]
+
+A skill has a high universality score if it matters in many occupations, has a stable sign, and exhibits limited dispersion in importance across occupations. By contrast, a skill can be highly important on average but still occupation-specific if its cross-occupation variance is large. In the cross-occupation comparison, the analysis focuses on modules with at least `r params$min_eligible_occ_compare` eligible occupations.
+
+# Estimation
+
+```{r pooled-baseline-estimation, include=FALSE}
+baseline_pf <- make_penalty_factors(
+  feature_names = skill_vars,
+  exposure_tbl = skill_exposure,
+  min_pf = params$min_penalty_factor,
+  max_pf = params$max_penalty_factor
+)
+
+X_baseline <- make_sparse_design(
+  dat = analysis_df,
+  fe_var = "group_id",
+  feature_vars = skill_vars
+)
+
+pf_vec_baseline <- build_penalty_vector(colnames(X_baseline), baseline_pf)
+
+fit_baseline <- fit_cv_enet_alpha_grid(
+  X = X_baseline,
+  y = analysis_df$success_2123,
+  alpha_grid = unlist(params$alpha_grid),
+  requested_nfolds = params$nfolds,
+  penalty.factor = pf_vec_baseline,
+  lambda_rule = params$lambda_rule,
+  family = "gaussian",
+  seed = 101
+)
+
+beta_baseline <- extract_named_beta(
+  cvfit = fit_baseline$cvfit,
+  s = fit_baseline$lambda,
+  target_names = skill_vars
+)
+
+stab_baseline <- stability_subsampling(
+  X = X_baseline,
+  y = analysis_df$success_2123,
+  feature_names = skill_vars,
+  alpha = fit_baseline$alpha,
+  requested_nfolds = params$nfolds,
+  penalty.factor = pf_vec_baseline,
+  B = params$B_main,
+  subsample_frac = params$subsample_frac_main,
+  lambda_rule = params$lambda_rule,
+  family = "gaussian",
+  seed = 202
+)
+
+baseline_results <- tibble::tibble(
+  feature = skill_vars,
+  beta_full = beta_baseline[skill_vars]
+) %>%
+  dplyr::left_join(stab_baseline, by = c("feature")) %>%
+  dplyr::left_join(
+    skill_lookup %>% dplyr::transmute(feature = skill_var, moduleid, module_label, module_label_display),
+    by = "feature"
+  ) %>%
+  dplyr::left_join(
+    skill_exposure %>% dplyr::transmute(feature = skill_var, n_exposed),
+    by = "feature"
+  ) %>%
+  dplyr::mutate(
+    sw = abs(beta_full) * selection_freq,
+    beta_pp = 100 * beta_full,
+    abs_beta_pp = abs(beta_pp),
+    selected_any = selection_freq > 0
+  ) %>%
+  dplyr::arrange(dplyr::desc(sw), dplyr::desc(abs_beta_pp))
+
+readr::write_csv(baseline_results, file.path(output_dir, "baseline_results.csv"))
+readr::write_csv(fit_baseline$tuning_table, file.path(output_dir, "baseline_alpha_tuning.csv"))
+```
+
+```{r piecewise-estimation, include=FALSE}
+piece_obj <- make_piecewise_features(
+  dat = analysis_df,
+  skill_vars = skill_vars,
+  knot = params$knot_hi
+)
+
+analysis_df_pw <- piece_obj$data
+pw_map <- piece_obj$map
+
+pw_feature_vars <- c(pw_map$lo_var, pw_map$hi_var)
+
+pw_exposure <- tibble::tibble(
+  skill_var = c(pw_map$lo_var, pw_map$hi_var),
+  n_exposed = c(
+    skill_exposure$n_exposed[match(pw_map$skill_var, skill_exposure$skill_var)],
+    skill_exposure$n_exposed[match(pw_map$skill_var, skill_exposure$skill_var)]
+  )
+)
+
+X_piecewise <- make_sparse_design(
+  dat = analysis_df_pw,
+  fe_var = "group_id",
+  feature_vars = pw_feature_vars
+)
+
+pw_pf <- make_penalty_factors(
+  feature_names = pw_feature_vars,
+  exposure_tbl = pw_exposure,
+  min_pf = params$min_penalty_factor,
+  max_pf = params$max_penalty_factor
+)
+
+pf_vec_piecewise <- build_penalty_vector(colnames(X_piecewise), pw_pf)
+
+fit_piecewise <- fit_cv_enet_alpha_grid(
+  X = X_piecewise,
+  y = analysis_df_pw$success_2123,
+  alpha_grid = unlist(params$alpha_grid),
+  requested_nfolds = params$nfolds,
+  penalty.factor = pf_vec_piecewise,
+  lambda_rule = params$lambda_rule,
+  family = "gaussian",
+  seed = 303
+)
+
+beta_piecewise <- extract_named_beta(
+  cvfit = fit_piecewise$cvfit,
+  s = fit_piecewise$lambda,
+  target_names = pw_feature_vars
+)
+
+stab_piecewise <- stability_subsampling(
+  X = X_piecewise,
+  y = analysis_df_pw$success_2123,
+  feature_names = pw_feature_vars,
+  alpha = fit_piecewise$alpha,
+  requested_nfolds = params$nfolds,
+  penalty.factor = pf_vec_piecewise,
+  B = params$B_main,
+  subsample_frac = params$subsample_frac_main,
+  lambda_rule = params$lambda_rule,
+  family = "gaussian",
+  seed = 404
+)
+
+piecewise_feature_results <- tibble::tibble(
+  feature = pw_feature_vars,
+  beta_full = beta_piecewise[pw_feature_vars]
+) %>%
+  dplyr::left_join(stab_piecewise, by = "feature")
+
+piecewise_skill_results <- pw_map %>%
+  dplyr::transmute(
+    feature = skill_var,
+    lo_var,
+    hi_var
+  ) %>%
+  dplyr::mutate(
+    beta_lo = piecewise_feature_results$beta_full[match(lo_var, piecewise_feature_results$feature)],
+    beta_hi = piecewise_feature_results$beta_full[match(hi_var, piecewise_feature_results$feature)],
+    pi_lo = piecewise_feature_results$selection_freq[match(lo_var, piecewise_feature_results$feature)],
+    pi_hi = piecewise_feature_results$selection_freq[match(hi_var, piecewise_feature_results$feature)],
+    pi_any = pmax(pi_lo, pi_hi, na.rm = TRUE),
+    slope_above_knot = beta_lo + beta_hi,
+    delta_hi = beta_hi,
+    sw_total = pi_any * (abs(beta_lo) + abs(beta_hi)),
+    sw_hi = pi_any * pmax(beta_hi, 0),
+    sw_nonlinear = pi_any * abs(beta_hi)
+  ) %>%
+  dplyr::left_join(
+    skill_lookup %>% dplyr::transmute(feature = skill_var, moduleid, module_label, module_label_display),
+    by = "feature"
+  ) %>%
+  dplyr::mutate(
+    beta_lo_pp = 100 * beta_lo,
+    beta_hi_pp = 100 * beta_hi,
+    slope_above_knot_pp = 100 * slope_above_knot
+  ) %>%
+  dplyr::arrange(dplyr::desc(sw_hi), dplyr::desc(sw_nonlinear), dplyr::desc(sw_total))
+
+piecewise_has_positive <- any(piecewise_skill_results$sw_hi > 0, na.rm = TRUE)
+
+if (piecewise_has_positive) {
+  piecewise_table_caption <- paste0(
+    "Modules with the strongest additional payoff above ",
+    params$knot_hi,
+    " standard deviation."
+  )
+  piecewise_table_mode_text <- paste0(
+    "The piecewise model asks whether the relationship between competence and early success is approximately linear or whether it becomes steeper in the upper tail of the proficiency distribution. ",
+    "The table ranks modules by the combination of a positive additional slope above the knot and repeated subsample selection. ",
+    "In this parameterization, a positive value in the column “Additional slope above knot” means that the success gradient is steeper once an individual is already well above the group average."
+  )
+  
+  piecewise_top_source <- piecewise_skill_results %>%
+    dplyr::arrange(dplyr::desc(sw_hi), dplyr::desc(sw_nonlinear), dplyr::desc(sw_total))
+} else {
+  piecewise_table_caption <- paste0(
+    "Modules with the strongest nonlinear association above ",
+    params$knot_hi,
+    " standard deviation."
+  )
+  piecewise_table_mode_text <- paste0(
+    "The piecewise model asks whether the relationship between competence and early success is approximately linear or whether it changes in the upper tail of the proficiency distribution. ",
+    "In the present estimates, no module shows a stable positive additional slope large enough to populate a positive-premium ranking. ",
+    "The table therefore reports the modules with the strongest absolute nonlinearity in the upper range, combining the size of the additional slope with repeated subsample selection."
+  )
+  
+  piecewise_top_source <- piecewise_skill_results %>%
+    dplyr::arrange(dplyr::desc(sw_nonlinear), dplyr::desc(sw_total), dplyr::desc(abs(beta_hi)))
+}
+
+piecewise_top_labels <- paste(head(piecewise_top_source$module_label_display, 5), collapse = ", ")
+
+readr::write_csv(piecewise_skill_results, file.path(output_dir, "piecewise_skill_results.csv"))
+readr::write_csv(fit_piecewise$tuning_table, file.path(output_dir, "piecewise_alpha_tuning.csv"))
+```
+
+```{r occupation-specific-estimation, include=FALSE}
+occ_results <- estimate_occ_specific_results(
+  dat = analysis_df,
+  skill_vars = skill_vars,
+  occ_exposure_tbl = occ_exposure,
+  alpha = fit_baseline$alpha,
+  requested_nfolds = params$nfolds,
+  lambda_rule = params$lambda_rule,
+  B_occ = params$B_occ,
+  subsample_frac_occ = params$subsample_frac_occ,
+  min_occ_n = params$min_occ_n,
+  min_pf = params$min_penalty_factor,
+  max_pf = params$max_penalty_factor,
+  family = "gaussian",
+  seed = 505
+)
+
+occ_results <- occ_results %>%
+  dplyr::left_join(
+    skill_lookup %>% dplyr::transmute(feature = skill_var, moduleid, module_label, module_label_display),
+    by = "feature"
+  )
+
+universality_results_all <- occ_results %>%
+  dplyr::group_by(feature, moduleid, module_label, module_label_display) %>%
+  dplyr::summarise(
+    eligible_occupations = sum(eligible, na.rm = TRUE),
+    selected_occupations = sum(eligible & selection_freq > 0, na.rm = TRUE),
+    coverage = ifelse(eligible_occupations > 0,
+                      selected_occupations / eligible_occupations, NA_real_),
+    mean_sw_occ = safe_mean(sw[eligible]),
+    sd_sw_occ = safe_sd2(sw[eligible]),
+    cv_sw = ifelse(!is.na(mean_sw_occ) && mean_sw_occ > 0, sd_sw_occ / mean_sw_occ, NA_real_),
+    sign_consistency = {
+      bet <- beta_full[eligible & selection_freq > 0]
+      if (length(bet) == 0) NA_real_ else max(mean(bet > 0), mean(bet < 0))
+    },
+    beneficial_share = {
+      bet <- beta_full[eligible & selection_freq > 0]
+      if (length(bet) == 0) NA_real_ else mean(bet > 0)
+    },
+    universality_score = ifelse(
+      is.na(mean_sw_occ) | is.na(coverage) | is.na(sign_consistency) | is.na(cv_sw),
+      NA_real_,
+      mean_sw_occ * coverage * sign_consistency / (1 + cv_sw)
+    ),
+    heterogeneity_score = ifelse(
+      is.na(sd_sw_occ) | is.na(coverage),
+      NA_real_,
+      sd_sw_occ * coverage
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(universality_score))
+
+universality_results <- universality_results_all %>%
+  dplyr::filter(eligible_occupations >= params$min_eligible_occ_compare) %>%
+  dplyr::arrange(dplyr::desc(universality_score))
+
+top5_universal_ids <- universality_results %>%
+  dplyr::filter(!is.na(universality_score)) %>%
+  dplyr::slice_max(order_by = universality_score, n = 5, with_ties = FALSE) %>%
+  dplyr::select(feature, moduleid, module_label_display)
+
+top5_hetero_ids <- universality_results %>%
+  dplyr::filter(!is.na(heterogeneity_score), coverage > 0) %>%
+  dplyr::slice_max(order_by = heterogeneity_score, n = 5, with_ties = FALSE) %>%
+  dplyr::select(feature, moduleid, module_label_display)
+
+universal_points_df <- occ_results %>%
+  dplyr::semi_join(top5_universal_ids, by = c("feature", "moduleid", "module_label_display")) %>%
+  dplyr::filter(eligible) %>%
+  dplyr::mutate(
+    sign_group = dplyr::case_when(
+      is.na(beta_full) ~ "Missing",
+      beta_full > 0 ~ "Positive",
+      TRUE ~ "Non-positive"
+    )
+  )
+
+hetero_points_df <- occ_results %>%
+  dplyr::semi_join(top5_hetero_ids, by = c("feature", "moduleid", "module_label_display")) %>%
+  dplyr::filter(eligible) %>%
+  dplyr::mutate(
+    sign_group = dplyr::case_when(
+      is.na(beta_full) ~ "Missing",
+      beta_full > 0 ~ "Positive",
+      TRUE ~ "Non-positive"
+    )
+  )
+
+readr::write_csv(occ_results, file.path(output_dir, "occupation_specific_results.csv"))
+readr::write_csv(universality_results_all, file.path(output_dir, "universality_results_all.csv"))
+readr::write_csv(universality_results, file.path(output_dir, "universality_results.csv"))
+```
+
+The pooled baseline model selects an elastic net mixing parameter of \(\alpha = `r fmt_num(fit_baseline$alpha, 2)`\) under the `r params$lambda_rule` rule. The piecewise model selects \(\alpha = `r fmt_num(fit_piecewise$alpha, 2)`\). These tuning choices are reported only to document the selected degree of sparsity; substantively, the main objects of interest are the stability-weighted skill rankings.
+
+# Results
+
+## Which skills matter most overall?
+
+```{r baseline-top-figure, fig.cap="Top 20 modules by stability-weighted pooled importance.", fig.height=6.2}
+plot_baseline_top <- baseline_results %>%
+  dplyr::slice_max(order_by = sw, n = 20, with_ties = FALSE) %>%
+  dplyr::mutate(module_label_display = forcats::fct_reorder(module_label_display, sw))
+
+p1 <- ggplot(plot_baseline_top, aes(x = module_label_display, y = sw)) +
+  geom_col(fill = "grey75", color = "black", width = 0.8) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Selection frequency × |coefficient|",
+    title = "Pooled ranking of module importance"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(
+  filename = file.path(output_dir, "figure_top20_pooled_skills.png"),
+  plot = p1,
+  width = 8.5,
+  height = 6.2,
+  dpi = 320
+)
+
+p1
+```
+
+Figure 1 ranks modules by the stability-weighted pooled score \(SW_m = \pi_m |\beta_m|\). Because the outcome is defined as success rather than dropout, positive coefficients indicate that stronger module performance is associated with a higher probability of early success. The ranking therefore answers the core question in a transparent way: it identifies the modules for which being better is most strongly associated with avoiding training dropout, conditional on occupation-by-entry-year fixed effects.
+
+The leading modules in the pooled ranking are `r paste(head(baseline_results$module_label_display, 5), collapse = ", ")`. This statement is descriptive only: the ranking summarizes which modules combine a relatively large full-sample coefficient with repeated selection across subsamples.
+
+```{r baseline-top-table}
+baseline_top_table <- baseline_results %>%
+  dplyr::slice_max(order_by = sw, n = 15, with_ties = FALSE) %>%
+  dplyr::transmute(
+    Module = module_label_display,
+    `Coefficient (pp)` = fmt_num(beta_pp, 2),
+    `Selection frequency` = fmt_num(selection_freq, 2),
+    `Stability-weighted score` = fmt_num(sw, 4),
+    `Exposure count` = scales::comma(n_exposed)
+  )
+
+knitr::kable(
+  baseline_top_table,
+  format = "latex",
+  booktabs = TRUE,
+  caption = "Top pooled modules in the baseline competence model.",
+  align = c("l", "r", "r", "r", "r")
+) %>%
+  kableExtra::kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+The coefficients in Table 2 are expressed in percentage points because the dependent variable is binary. A value of, say, 1.50 means that a one-standard-deviation increase in the module score is associated with a 1.5 percentage point higher probability of early success, conditional on occupation-year fixed effects. Since the model is regularized and optimized for predictive ranking, these values should be interpreted as relative predictive associations rather than causal marginal effects.
+
+## Do rewards become stronger at high proficiency?
+
+`r piecewise_table_mode_text`
+
+```{r piecewise-top-table}
+piecewise_top_table <- piecewise_top_source %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::transmute(
+    Module = module_label_display,
+    `Baseline slope up to knot (pp)` = fmt_num(beta_lo_pp, 2),
+    `Additional slope above knot (pp)` = fmt_num(beta_hi_pp, 2),
+    `Slope above knot (pp)` = fmt_num(slope_above_knot_pp, 2),
+    `Selection frequency (any piece)` = fmt_num(pi_any, 2),
+    `High-range score` = fmt_num(ifelse(piecewise_has_positive, sw_hi, sw_nonlinear), 4)
+  )
+
+knitr::kable(
+  piecewise_top_table,
+  format = "latex",
+  booktabs = TRUE,
+  caption = piecewise_table_caption,
+  align = c("l", "r", "r", "r", "r", "r")
+) %>%
+  kableExtra::kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+The top-ranked modules in the piecewise analysis are `r piecewise_top_labels`. The table is designed to remain informative even when the positive high-skill premium is weak, because the nonlinear specification is substantively relevant both when the slope becomes steeper and when the upper-tail association differs from the baseline slope in either direction.
+
+## How universal are these skills across occupations?
+
+```{r universality-figure, fig.cap=paste0("Top 20 modules by universality score across occupations (restricted to modules with at least ", params$min_eligible_occ_compare, " eligible occupations)."), fig.height=6.2}
+plot_universal_top <- universality_results %>%
+  dplyr::filter(!is.na(universality_score)) %>%
+  dplyr::slice_max(order_by = universality_score, n = 20, with_ties = FALSE) %>%
+  dplyr::mutate(module_label_display = forcats::fct_reorder(module_label_display, universality_score))
+
+p2 <- ggplot(plot_universal_top, aes(x = module_label_display, y = universality_score)) +
+  geom_col(fill = "grey75", color = "black", width = 0.8) +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Universality score",
+    title = "How portable is module importance across occupations?"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(
+  filename = file.path(output_dir, "figure_top20_universality.png"),
+  plot = p2,
+  width = 8.5,
+  height = 6.2,
+  dpi = 320
+)
+
+p2
+```
+
+The occupation-specific analysis separates broadly rewarded competencies from modules whose importance is concentrated in a smaller set of occupations. Figure 2 ranks modules by the universality score, which combines four ingredients: average occupation-specific importance, breadth of coverage across eligible occupations, sign consistency, and low relative dispersion across occupations. A module receives a high universality score if it matters in many occupations and in a similar direction. To avoid overstating portability based on very thin support, the cross-occupation comparison is restricted to modules observed in at least `r params$min_eligible_occ_compare` eligible occupations.
+
+The most universal modules in the data are `r paste(head(universality_results$module_label_display, 5), collapse = ", ")`. These are the modules that appear to travel most strongly across occupational contexts.
+
+```{r universality-table}
+universality_top_table <- universality_results %>%
+  dplyr::filter(!is.na(universality_score)) %>%
+  dplyr::slice_max(order_by = universality_score, n = 15, with_ties = FALSE) %>%
+  dplyr::transmute(
+    Module = module_label_display,
+    `Eligible occupations` = scales::comma(eligible_occupations),
+    Coverage = fmt_num(coverage, 2),
+    `Mean occ. SW` = fmt_num(mean_sw_occ, 4),
+    `SD occ. SW` = fmt_num(sd_sw_occ, 4),
+    `Sign consistency` = fmt_num(sign_consistency, 2),
+    `Universality score` = fmt_num(universality_score, 4)
+  )
+
+knitr::kable(
+  universality_top_table,
+  format = "latex",
+  booktabs = TRUE,
+  caption = paste0(
+    "Most universal modules across occupation-specific models (restricted to modules with at least ",
+    params$min_eligible_occ_compare,
+    " eligible occupations)."
+  ),
+  align = c("l", "r", "r", "r", "r", "r", "r")
+) %>%
+  kableExtra::kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+```{r universal-points-figure, fig.cap="Occupation-specific point values for the five most universal modules.", fig.height=7}
+p_universal_points <- universal_points_df %>%
+  dplyr::mutate(module_label_display = forcats::fct_reorder(module_label_display, sw, .fun = mean, .desc = TRUE)) %>%
+  ggplot(aes(x = 1, y = sw)) +
+  geom_jitter(width = 0.08, height = 0, alpha = 0.75, size = 1.6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.25, fatten = 0, linewidth = 0.4) +
+  facet_wrap(~ module_label_display, scales = "free_y", ncol = 2) +
+  labs(
+    x = NULL,
+    y = "Occupation-specific stability-weighted score",
+    title = "Top 5 universal modules: occupation-specific point values"
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(
+  filename = file.path(output_dir, "figure_top5_universal_points.png"),
+  plot = p_universal_points,
+  width = 8.5,
+  height = 7,
+  dpi = 320
+)
+
+p_universal_points
+```
+
+Figure 3 displays the occupation-specific point values for the five most universal modules. Each point corresponds to one eligible occupation-specific estimate. The horizontal bar in each panel marks the mean occupation-specific stability-weighted score. A tightly clustered cloud of points is consistent with portability across occupations, whereas a wider spread would indicate that even a highly ranked universal module still varies in importance across occupational settings.
+
+## Which skills are most occupation-specific?
+
+```{r heterogeneity-table}
+heterogeneity_top_table <- universality_results %>%
+  dplyr::filter(!is.na(heterogeneity_score), coverage > 0) %>%
+  dplyr::slice_max(order_by = heterogeneity_score, n = 15, with_ties = FALSE) %>%
+  dplyr::transmute(
+    Module = module_label_display,
+    `Eligible occupations` = scales::comma(eligible_occupations),
+    Coverage = fmt_num(coverage, 2),
+    `Mean occ. SW` = fmt_num(mean_sw_occ, 4),
+    `SD occ. SW` = fmt_num(sd_sw_occ, 4),
+    `CV` = fmt_num(cv_sw, 2),
+    `Heterogeneity score` = fmt_num(heterogeneity_score, 4)
+  )
+
+knitr::kable(
+  heterogeneity_top_table,
+  format = "latex",
+  booktabs = TRUE,
+  caption = paste0(
+    "Modules with the greatest cross-occupation heterogeneity in importance (restricted to modules with at least ",
+    params$min_eligible_occ_compare,
+    " eligible occupations)."
+  ),
+  align = c("l", "r", "r", "r", "r", "r", "r")
+) %>%
+  kableExtra::kable_styling(latex_options = c("hold_position", "scale_down"))
+```
+
+Whereas the universality score highlights portable skills, the heterogeneity score highlights modules whose importance varies strongly across occupations. These modules may still matter a great deal, but their value is not uniform. Instead, they appear to be rewarded more strongly in some occupational contexts than in others. The modules with the strongest cross-occupation heterogeneity are `r paste(head(universality_results %>% dplyr::filter(!is.na(heterogeneity_score)) %>% dplyr::arrange(dplyr::desc(heterogeneity_score)) %>% dplyr::pull(module_label_display), 5), collapse = ", ")`.
+
+```{r heterogeneity-points-figure, fig.cap="Occupation-specific point values for the five most occupation-specific modules.", fig.height=7}
+p_hetero_points <- hetero_points_df %>%
+  dplyr::mutate(module_label_display = forcats::fct_reorder(module_label_display, sw, .fun = mean, .desc = TRUE)) %>%
+  ggplot(aes(x = 1, y = sw)) +
+  geom_jitter(width = 0.08, height = 0, alpha = 0.75, size = 1.6) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.25, fatten = 0, linewidth = 0.4) +
+  facet_wrap(~ module_label_display, scales = "free_y", ncol = 2) +
+  labs(
+    x = NULL,
+    y = "Occupation-specific stability-weighted score",
+    title = "Top 5 occupation-specific modules: occupation-specific point values"
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(
+  filename = file.path(output_dir, "figure_top5_heterogeneity_points.png"),
+  plot = p_hetero_points,
+  width = 8.5,
+  height = 7,
+  dpi = 320
+)
+
+p_hetero_points
+```
+
+Figure 4 displays the occupation-specific point values for the five most occupation-specific modules. Here, dispersion itself is substantively informative: the panels visualize how strongly the same module can differ in importance across occupations even when the module is observed in a sufficient number of occupational contexts to support comparison.
+
+Taken together, the pooled and occupation-specific analyses distinguish three conceptually different cases. First, some modules rank highly in the pooled model and also receive high universality scores; these are candidate general-purpose competencies. Second, some modules rank highly in the pooled model but have large cross-occupation variance; these are important but specialized competencies. Third, some modules appear weak in the pooled ranking because their importance is concentrated in a limited set of occupations; the occupation-specific analysis recovers such patterns.
+
+# Conclusion
+
+This paper proposes a simple way to measure which tested skills are most strongly associated with early labor market success in a setting where workers complete occupation-specific skill modules rather than a common universal test. By standardizing module performance within occupation-year cells, reshaping the long person-module data into a person-level skill matrix, and combining fixed-effects elastic net estimation with stability-based ranking, the analysis produces an interpretable map of the skills that matter most for avoiding early dropout.
+
+The pooled analysis identifies the modules for which being better is most strongly associated with success within the same occupation and entry cohort. The nonlinear specification further shows whether rewards are concentrated in the top tail of the proficiency distribution. The occupation-specific analysis adds an important second layer by separating broadly rewarded competencies from skills whose value is occupation-specific.
+
+Substantively, the framework is useful even before strong structural interpretation is imposed. It provides a disciplined descriptive answer to two policy-relevant questions: which competencies are associated with better early outcomes, and whether those competencies appear to be widely transferable or narrowly occupation-bound. This distinction matters for training design, counseling, remediation policy, and the interpretation of skill deficits in vocational pathways.
+
+At the same time, the estimates remain associative. They do not identify the causal return to improving a specific skill, and they inherit the usual limitations of predictive regularization: rankings may depend on the tested skill universe, on the outcome used, and on the institutional environment that determines which modules are assessed in which occupations. Still, as a first step, the approach provides a transparent and scalable empirical ranking of occupationally meaningful skills.
+
+# Reproducibility notes
+
+The code writes the main intermediate and final outputs. In particular, it saves:
+
+- `skill_lookup.csv`
+- `person_base.csv`
+- `baseline_results.csv`
+- `piecewise_skill_results.csv`
+- `occupation_specific_results.csv`
+- `universality_results_all.csv`
+- `universality_results.csv`
+- `figure_top20_pooled_skills.png`
+- `figure_top20_universality.png`
+- `figure_top5_universal_points.png`
+- `figure_top5_heterogeneity_points.png`
+
+You can therefore inspect the rankings and figures directly even before revising the narrative discussion of the results.
+
+# References
+
+Cnossen, F., Piracha, M., & Tchuente, G. (2025). *Learning the Right Skill: Vocational Curricula and Returns to Skills*. *Journal of Labor Economics*, 43(3), 665--694.
+
+Deming, D. J. (2017). *The Growing Importance of Social Skills in the Labor Market*. *Quarterly Journal of Economics*, 132(4), 1593--1640.
+
+Dorn, D., Schoner, F., Seebacher, M., Simon, L., & Woessmann, L. (2025). *Measuring Human Capital and the Gender Skill Gap*. CESifo Working Paper No. 11846.
+
+Friedman, J., Hastie, T., & Tibshirani, R. (2010). *Regularization Paths for Generalized Linear Models via Coordinate Descent*. *Journal of Statistical Software*, 33(1), 1--22.
+
+Hanushek, E. A., Schwerdt, G., Wiederhold, S., & Woessmann, L. (2015). *Returns to Skills around the World: Evidence from PIAAC*. *European Economic Review*, 73, 103--130.
+
+Heckman, J. J., Stixrud, J., & Urzua, S. (2006). *The Effects of Cognitive and Noncognitive Abilities on Labor Market Outcomes and Social Behavior*. *Journal of Labor Economics*, 24(3), 411--482.
+
+Meinshausen, N., & B\"uhlmann, P. (2010). *Stability Selection*. *Journal of the Royal Statistical Society: Series B*, 72(4), 417--473.
+
+Murnane, R. J., Willett, J. B., & Levy, F. (1995). *The Growing Importance of Cognitive Skills in Wage Determination*. *Review of Economics and Statistics*, 77(2), 251--266.
+
+Woessmann, L. (2024). *A Multidimensional Perspective on Human Capital*. IZA Discussion Paper No. 17395.
+
+Zou, H., & Hastie, T. (2005). *Regularization and Variable Selection via the Elastic Net*. *Journal of the Royal Statistical Society: Series B*, 67(2), 301--320.
