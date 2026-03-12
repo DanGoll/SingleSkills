@@ -1261,7 +1261,7 @@ knitr::kable(
   kableExtra::kable_styling(latex_options = c("hold_position", "scale_down"))
 ```
 
-Whereas the universality score highlights portable skills, the heterogeneity score highlights modules whose importance varies strongly across occupations. These modules may still matter a great deal, but their value is not uniform. Instead, they appear to be rewarded more strongly in some occupational contexts than in others. The modules with the strongest cross-occupation heterogeneity are `r paste(head(universality_results %>% dplyr::filter(!is.na(heterogeneity_score)) %>% dplyr::arrange(dplyr::desc(heterogeneity_score)) %>% dplyr::pull(module_label_display), 5), collapse = ", ")`.
+Whereas the universality score highlights portable skills, the heterogeneity score highlights modules whose importance varies strongly across occupations. These modules may still matter a great deal, but their value is not uniform. Instead, they appear to be rewarded more strongly in some occupational contexts than in others. The modules with the strongest cross-occupation heterogeneity are `r paste(head(universality_results %>% dplyr::filter(!is.na(heterogeneity_score)) %>% dplyr::arrange(dplyr::desc(heterogeneity_score)) %>% dplyr::pull(module_label_display), 5), collapse = ", ")`. 
 
 ```{r heterogeneity-points-figure, fig.cap="Occupation-specific point values for the five most occupation-specific modules.", fig.height=7}
 p_hetero_points <- hetero_points_df %>%
